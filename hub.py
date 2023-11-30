@@ -10,6 +10,8 @@ from ryu.lib.packet import arp
 from ryu.lib.packet import ether_types
 from ryu.lib.packet import in_proto as inet
 from ryu.lib import dpid as dpid_lib
+from ryu.lib.packet import in_proto
+from ryu.lib.packet import ipv4
 from ryu.lib.packet import tcp, udp, icmp
 
 """
@@ -26,6 +28,7 @@ class LearningSwitch(app_manager.RyuApp):
     def __init__(self, *args, **kwargs):
         ''' Create instance of the controller '''
         super(LearningSwitch, self).__init__(*args, **kwargs)
+        self.mac_to_port = {}
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -36,6 +39,7 @@ class LearningSwitch(app_manager.RyuApp):
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
         print("EVENT: Switch added || dpid: 0x%09x"%(datapath.id))
+        self.mac_to_port[datapath.id] = {}
         self.add_flow(datapath, 0, match, actions)
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
@@ -58,11 +62,12 @@ class LearningSwitch(app_manager.RyuApp):
         # This is where most learning functionality should be implemented
         ####### !
 
-        self.logger.info("PACKET OUT: Flooding")
+        #self.logger.info("PACKET OUT: Flooding")
+
         out_port = ofproto.OFPP_FLOOD                       # Specify Flood | Given we have 0 idea where tos end the packet...
 
         # Extract L4 header information
-        self.extract_l4_info(pkt, datapath, in_port)
+        self.extract_l4_info(pkt, datapath, in_port, ofproto, parser)
 
         # The action of sending a packet out converted to the correct OpenFlow format
         actions = [parser.OFPActionOutput(out_port)]
@@ -84,101 +89,99 @@ class LearningSwitch(app_manager.RyuApp):
         self.logger.info("FLOW MOD: Written")
         datapath.send_msg(mod)
 
-    def extract_l4_info(self, pkt, datapath, in_port):
+    def extract_l4_info(self, pkt, datapath, in_port, ofproto, parser):
         ''' Extract L4 header information and call the appropriate handler '''
-        tcp_header = pkt.get_protocol(tcp.tcp)
-        udp_header = pkt.get_protocol(udp.udp)
+        eth = pkt.get_protocols(ethernet.ethernet)[0]
+        dst = eth.dst
+        src = eth.src
+        dpid = datapath.id
+        self.mac_to_port.setdefault(dpid, {})
+        self.logger.info("Received packet: %s %s %s %s", dpid, src, dst, in_port)
+        self.mac_to_port[dpid][src] = in_port
 
-        if tcp_header:
-            # TCP packet handling
-            self.handle_tcp(pkt, datapath, in_port)
-        elif udp_header:
-            # UDP packet handling
-            self.handle_udp(pkt, datapath, in_port)
+        if dst in self.mac_to_port[dpid]:
+            out_port = self.mac_to_port[dpid][dst]
         else:
-            # Other L4 types (for now, we'll handle ICMP)
-            self.handle_icmp(pkt, datapath, in_port)
+            out_port = ofproto.OFPP_FLOOD
 
-    # 添加新的处理函数
+        actions = [parser.OFPPacketOut(out_port)]
 
-    def handle_tcp(self, pkt, datapath, in_port):
+        # install a flow to avoid packet_in next time
+        if out_port != ofproto.OFPP_FLOOD:
+
+            # check IP Protocol and create a match for IP
+            if eth.ethertype == ether_types.ETH_TYPE_IP:
+                ip = pkt.get_protocol(ipv4.ipv4)
+                srcip = ip.src
+                dstip = ip.dst
+                protocol = ip.proto
+
+                #if ICMP Portocol
+                if protocol == in_proto.IPPROTO_ICMP:
+                    self.handle_icmp(srcip, dstip, protocol, pkt, datapath, out_port)
+
+                elif protocol == in_proto.IPPROTO_TCP:
+                    self.handle_tcp(srcip, dstip, protocol, pkt, datapath, out_port)
+
+                elif protocol == in_proto.IPPROTO_UDP:
+                    self.handle_udp(srcip, dstip, protocol, pkt, datapath, out_port)
+        out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id, in_port=in_port, actions=actions, data=msg.data)
+        datapath.send_msg(out)
+
+    def handle_tcp(self, srcip, dstip, protocol, pkt, datapath, out_port):
         ''' Handle TCP packet '''
         tcp_header = pkt.get_protocol(tcp.tcp)
-
-        # 获取源端口和目标端口
-        src_port = tcp_header.src_port
-        dst_port = tcp_header.dst_port
-
-        self.logger.info(f"TCP Packet: Src Port - {src_port}, Dst Port - {dst_port}")
-
-        # Add your TCP handling logic here
-
         # 创建 TCP 数据包的匹配字段
         match = datapath.ofproto_parser.OFPMatch(
-            in_port=in_port,
             eth_type=ether_types.ETH_TYPE_IP,  # 指定 IP 协议
-            ip_proto=inet.IPPROTO_TCP,  # 指定 TCP 协议
-            tcp_src=src_port,  # 匹配源端口
-            tcp_dst=dst_port  # 匹配目标端口
+            ip_proto=protocol,  # 指定 TCP 协议
+            ipv4_src=srcip,
+            ipv4_dst=dstip,
+            tcp_src=tcp_header.src_prot,  # 匹配源端口
+            tcp_dst=tcp_header.dst_port  # 匹配目标端口
         )
-
         # 指定动作（在这里我们直接输出到源端口，你可以根据需要调整）
-        actions = [datapath.ofproto_parser.OFPActionOutput(in_port)]
-
+        actions = [datapath.ofproto_parser.OFPActionOutput(out_port)]
         # 发送 Flow Mod 到 Datapath
         self.add_flow(datapath, 1, match, actions)
+        return
 
 
-    def handle_udp(self, pkt, datapath, in_port):
+    def handle_udp(self, srcip, dstip, protocol, pkt, datapath, out_port):
         ''' Handle UDP packet '''
         udp_header = pkt.get_protocol(udp.udp)
 
-        # 获取源端口和目标端口
-        src_port = udp_header.src_port
-        dst_port = udp_header.dst_port
-
-        self.logger.info(f"UDP Packet: Src Port - {src_port}, Dst Port - {dst_port}")
-
-        # Add your UDP handling logic here
-
         # 创建 UDP 数据包的匹配字段
         match = datapath.ofproto_parser.OFPMatch(
-            in_port=in_port,
             eth_type=ether_types.ETH_TYPE_IP,  # 指定 IP 协议
-            ip_proto=inet.IPPROTO_UDP,  # 指定 UDP 协议
-            udp_src=src_port,  # 匹配源端口
-            udp_dst=dst_port  # 匹配目标端口
+            ip_proto=protocol,  # 指定 TCP 协议
+            ipv4_src=srcip,
+            ipv4_dst=dstip,
+            tcp_src=udp_header.src_prot,  # 匹配源端口
+            tcp_dst=udp_header.dst_port  # 匹配目标端口
         )
-
         # 指定动作（在这里我们直接输出到源端口，你可以根据需要调整）
-        actions = [datapath.ofproto_parser.OFPActionOutput(in_port)]
-
+        actions = [datapath.ofproto_parser.OFPActionOutput(out_port)]
         # 发送 Flow Mod 到 Datapath
         self.add_flow(datapath, 1, match, actions)
+        return
 
-    def handle_icmp(self, pkt, datapath, in_port):
+    def handle_icmp(self, srcip, dstip, protocol, pkt, datapath, out_port):
         ''' Handle ICMP packet '''
         icmp_header = pkt.get_protocol(icmp.icmp)
-
-        # 获取 ICMP 类型和代码
-        icmp_type = icmp_header.type_
-        icmp_code = icmp_header.code
-
-        self.logger.info(f"ICMP Packet: Type - {icmp_type}, Code - {icmp_code}")
-
         # 创建 ICMP 数据包的匹配字段
         match = datapath.ofproto_parser.OFPMatch(
-            in_port=in_port,
             eth_type=ether_types.ETH_TYPE_IP,  # 指定 IP 协议
-            ip_proto=inet.IPPROTO_ICMP,  # 指定 ICMP 协议
-            icmpv4_type=icmp_type,  # 匹配 ICMP 类型
-            icmpv4_code=icmp_code  # 匹配 ICMP 代码
+            ip_proto=protocol,  # 指定 TCP 协议
+            ipv4_src=srcip,
+            ipv4_dst=dstip,
+            tcp_src=icmp_header.src_prot,  # 匹配源端口
+            tcp_dst=icmp_header.dst_port  # 匹配目标端口
         )
-
         # 指定动作（在这里我们直接输出到源端口，你可以根据需要调整）
-        actions = [datapath.ofproto_parser.OFPActionOutput(in_port)]
-
+        actions = [datapath.ofproto_parser.OFPActionOutput(out_port)]
         # 发送 Flow Mod 到 Datapath
         self.add_flow(datapath, 1, match, actions)
+        return
 
 
